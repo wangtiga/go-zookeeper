@@ -5,13 +5,16 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
 	// ErrDeadlock is returned by Lock when trying to lock twice without unlocking first
 	ErrDeadlock = errors.New("zk: trying to acquire a lock twice")
 	// ErrNotLocked is returned by Unlock when trying to release a lock that has not first be acquired.
-	ErrNotLocked = errors.New("zk: not locked")
+	ErrNotLocked   = errors.New("zk: not locked")
+	ErrLockTimeOut = errors.New("zk: lock timeout")
+	ErrLockBusy    = errors.New("zk: lock busy, too many queue")
 )
 
 // Lock is a mutual exclusion lock.
@@ -39,38 +42,57 @@ func parseSeq(path string) (int, error) {
 	return strconv.Atoi(parts[len(parts)-1])
 }
 
+func RecursionCreatePath(c *Conn, path string, acl []ACL) error {
+	// Create parent node.
+	parts := strings.Split(path, "/")
+	pth := ""
+	for _, p := range parts[1:] {
+		var exists bool
+		pth += "/" + p
+		exists, _, err := c.Exists(pth)
+		if err != nil {
+			return err
+		}
+		if exists == true {
+			continue
+		}
+		if _, err = c.Create(pth, []byte{}, 0, acl); err != nil && err != ErrNodeExists {
+			return err
+		}
+	}
+	return nil
+}
+
 // Lock attempts to acquire the lock. It will wait to return until the lock
 // is acquired or an error occurs. If this instance already has the lock
 // then ErrDeadlock is returned.
 func (l *Lock) Lock() error {
+	return l.TryLock(-1, time.Duration(24)*time.Hour)
+}
+
+func (l *Lock) TryLock(maxQueue int, maxTimeOut time.Duration) error {
 	if l.lockPath != "" {
 		return ErrDeadlock
+	}
+	if maxQueue > 0 {
+		children, _, err := l.c.Children(l.path)
+		if nil == err {
+			// 忽略错误，因为第一次加锁，肯定会出现 ErrNoNode
+			if len(children) > maxQueue {
+				return ErrLockBusy
+			}
+		}
 	}
 
 	prefix := fmt.Sprintf("%s/lock-", l.path)
 
-	path := ""
+	lockPath := ""
 	var err error
 	for i := 0; i < 3; i++ {
-		path, err = l.c.CreateProtectedEphemeralSequential(prefix, []byte{}, l.acl)
+		lockPath, err = l.c.CreateProtectedEphemeralSequential(prefix, []byte{}, l.acl)
 		if err == ErrNoNode {
-			// Create parent node.
-			parts := strings.Split(l.path, "/")
-			pth := ""
-			for _, p := range parts[1:] {
-				var exists bool
-				pth += "/" + p
-				exists, _, err = l.c.Exists(pth)
-				if err != nil {
-					return err
-				}
-				if exists == true {
-					continue
-				}
-				_, err = l.c.Create(pth, []byte{}, 0, l.acl)
-				if err != nil && err != ErrNodeExists {
-					return err
-				}
+			if err := RecursionCreatePath(l.c, l.path, l.acl); nil != err {
+				return err
 			}
 		} else if err == nil {
 			break
@@ -82,7 +104,7 @@ func (l *Lock) Lock() error {
 		return err
 	}
 
-	seq, err := parseSeq(path)
+	seq, err := parseSeq(lockPath)
 	if err != nil {
 		return err
 	}
@@ -124,14 +146,28 @@ func (l *Lock) Lock() error {
 			continue
 		}
 
-		ev := <-ch
-		if ev.Err != nil {
-			return ev.Err
+		select {
+		case ev := <-ch:
+			{
+				if ev.Err != nil {
+					return ev.Err
+				}
+			}
+		case <-time.After(maxTimeOut):
+			{
+				if err := l.c.Delete(lockPath, -1); err != nil {
+					return err
+				}
+				if err := l.c.Delete(l.path, -1); err != nil && err != ErrNotEmpty {
+					fmt.Println("Unlock error del path=", l.path, ",err", err)
+				}
+				return ErrLockTimeOut
+			}
 		}
 	}
 
 	l.seq = seq
-	l.lockPath = path
+	l.lockPath = lockPath
 	return nil
 }
 
@@ -143,6 +179,9 @@ func (l *Lock) Unlock() error {
 	}
 	if err := l.c.Delete(l.lockPath, -1); err != nil {
 		return err
+	}
+	if err := l.c.Delete(l.path, -1); err != nil && err != ErrNotEmpty {
+		fmt.Println("Unlock error del path=", l.path, ",err", err)
 	}
 	l.lockPath = ""
 	l.seq = 0
