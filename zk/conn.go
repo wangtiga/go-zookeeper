@@ -36,7 +36,7 @@ var DefaultLogger Logger = defaultLogger{}
 
 const (
 	bufferSize      = 1536 * 1024
-	eventChanSize   = 6
+	eventChanSize   = 1024
 	sendChanSize    = 16
 	protectedPrefix = "_c_"
 )
@@ -354,6 +354,7 @@ func (c *Conn) sendEvent(evt Event) {
 	select {
 	case c.eventChan <- evt:
 	default:
+		c.logger.Printf("zk: event channel full - it must be monitored and never allowed to be full. eventChanSize=%d,evt=%v", eventChanSize, evt)
 		// panic("zk: event channel full - it must be monitored and never allowed to be full")
 	}
 }
